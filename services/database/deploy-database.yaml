@@ -1,0 +1,125 @@
+# Criacao Volume Persistente
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgres-pv
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /mnt/data/postgres
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+
+# Ficheiro para criar tabelas iniciais
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-sql
+data:
+  init.sql: |
+    -- Script inicial para criar tabelas
+    
+    CREATE TABLE tokens (
+    id SERIAL PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    expires_at TIMESTAMP NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS events (
+        id SERIAL PRIMARY KEY,
+        timestamp TIMESTAMP NOT NULL,
+        source TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        source_ip TEXT,
+        destination_ip TEXT,
+        message TEXT,
+        extra JSONB
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_source ON events(source);
+    CREATE INDEX IF NOT EXISTS idx_severity ON events(severity);
+    CREATE INDEX IF NOT EXISTS idx_source_ip ON events(source_ip);
+    CREATE INDEX IF NOT EXISTS idx_destination_ip ON events(destination_ip);
+
+#Deployment E Servicos PostgreSQL
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15
+        ports:
+          - containerPort: 5432
+        env:
+          - name: POSTGRES_USER
+            valueFrom:
+              secretKeyRef:
+                name: postgres-secret
+                key: POSTGRES_USER
+          - name: POSTGRES_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: postgres-secret
+                key: POSTGRES_PASSWORD
+          - name: POSTGRES_DB
+            valueFrom:
+              secretKeyRef:
+                name: postgres-secret
+                key: POSTGRES_DB
+        volumeMounts:
+            # Volume para db
+          - mountPath: /var/lib/postgresql/data
+            name: postgres-storage
+            # Volume para script inicial
+          - mountPath: /docker-entrypoint-initdb.d
+            name: init-sql          
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+        - name: init-sql
+          configMap:
+            name: postgres-init-sql
+            items:
+              - key: init.sql
+                path: init.sql
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector:
+    app: postgres
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432

@@ -1,0 +1,64 @@
+-----------------SETUP OBRIGATORIO-------------------------
+LINKERD para mtls
+
+linkerd install --crds | kubectl apply -f -
+linkerd install --set proxyInit.runAsRoot=true | kubectl apply -f -
+linkerd check
+kubectl annotate namespace default linkerd.io/inject=enabled
+
+
+INGRESS para WAF
+
+Dockerstudio
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.14.0/deploy/static/provider/cloud/deploy.yaml
+
+kubectl edit configmap nginx-configuration -n ingress-nginx
+
+data:
+  enable-modsecurity: "true"
+  enable-owasp-core-rules: "true"
+
+kubectl get pods -n ingress-nginx
+kubectl get svc -n ingress-nginx
+
+
+minikube
+minikube addons enable ingress
+
+-----------------------------------------
+DEPLOY      deploy-cluster.yaml
+--------------------------------------
+START
+1- Criar Token
+    api.siemk8s.com/token/create
+    Basic Authenticatiomn: Username:Admin e Password: Admin123!
+        Por defeito são estas, mas podem ser alteradas via env
+    Body: device_id: dashboard
+2- https://dashboard.siemk8s.com/login
+3- https://dashboard.siemk8s.com/connections/datasources
+    Configurar o token para poder comunicar com a api
+    ADD Header 
+    Header: Authorization
+    Value: Bearer ..................
+    Unckeck TLS certificate validation
+4-  Para criar um evento 
+    api.siemk8s.com/event
+    Token
+    Body:
+    {
+    "timestamp": "2026-01-17T18:00:00Z",
+    "source": "firewall02",
+    "severity": "high",
+    "event_type": "ddos",
+    "source_ip": "192.168.1.5",
+    "destination_ip": "10.0.0.10",
+    "message": "Port scan detected"
+  }
+  5- Para ver todos os eventos
+      api.siemk8s.com/events
+      Token
+
+LOGS
+Para ver os logs centralizados
+
+kubectl port-forward -n logs deploy/kibana 5601:5601

@@ -1,0 +1,56 @@
+#  tem de ter instalado minikube addons enable ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cluster-ingress
+  namespace: default
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/limit-connections: "20"
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    nginx.ingress.kubernetes.io/modsecurity-enabled: "true"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecRequestBodyAccess On
+
+      SecRule ARGS "(union.*select.*)|(select.*from.*information_schema)" \
+          "id:1001,phase:2,deny,status:403,msg:'SQL Injection attempt'"
+
+      SecRule ARGS "<script>" \
+          "id:1002,phase:2,deny,status:403,msg:'XSS attempt detected'"
+
+      SecRule REQUEST_HEADERS:User-Agent "BadBot|EvilScanner" \
+          "id:1003,phase:1,deny,status:403,msg:'Known bad bot'"
+
+      SecRequestBodyLimit 10485760
+      SecRequestBodyNoFilesLimit 1048576
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.siemk8s.com
+        - dashboard.siemk8s.com
+      secretName: tls-certificates
+  rules:
+    - host: api.siemk8s.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8001
+    - host: dashboard.siemk8s.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dashboard
+                port:
+                  number: 3000  

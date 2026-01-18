@@ -1,0 +1,605 @@
+#DB
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret
+type: Opaque
+stringData:
+  POSTGRES_USER: user
+  POSTGRES_PASSWORD: password
+  POSTGRES_DB: siem
+  DATABASE_URL: postgresql://user:password@postgres:5432/siem
+---
+# Criacao Volume Persistente
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgres-pv
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /mnt/data/postgres
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+# Ficheiro para criar tabelas iniciais
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-sql
+data:
+  init.sql: |
+    -- Script inicial para criar tabelas
+    
+    CREATE TABLE tokens (
+    id SERIAL PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    expires_at TIMESTAMP NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS events (
+        id SERIAL PRIMARY KEY,
+        timestamp TIMESTAMP NOT NULL,
+        source TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        source_ip TEXT,
+        destination_ip TEXT,
+        message TEXT,
+        extra JSONB
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_source ON events(source);
+    CREATE INDEX IF NOT EXISTS idx_severity ON events(severity);
+    CREATE INDEX IF NOT EXISTS idx_source_ip ON events(source_ip);
+    CREATE INDEX IF NOT EXISTS idx_destination_ip ON events(destination_ip);
+#Deployment E Servicos PostgreSQL
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15
+        ports:
+          - containerPort: 5432
+        env:
+          - name: POSTGRES_USER
+            valueFrom:
+              secretKeyRef:
+                name: postgres-secret
+                key: POSTGRES_USER
+          - name: POSTGRES_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: postgres-secret
+                key: POSTGRES_PASSWORD
+          - name: POSTGRES_DB
+            valueFrom:
+              secretKeyRef:
+                name: postgres-secret
+                key: POSTGRES_DB
+        volumeMounts:
+            # Volume para db
+          - mountPath: /var/lib/postgresql/data
+            name: postgres-storage
+            # Volume para script inicial
+          - mountPath: /docker-entrypoint-initdb.d
+            name: init-sql          
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+        - name: init-sql
+          configMap:
+            name: postgres-init-sql
+            items:
+              - key: init.sql
+                path: init.sql
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector:
+    app: postgres
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: auth-secret
+type: Opaque
+stringData:
+  SECRET_KEY: "cAsdd1225/(932&/(li1HS"
+  ADMIN_USER: "admin"
+  ADMIN_PASSWORD: "Admin123!"
+---
+#Deployment e Service do Auth
+#Deployment e Service do Auth
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: auth
+  template:
+    metadata:
+      labels:
+        app: auth
+    spec:
+      containers:
+        - name: auth
+          image: davids2006/siem_auth:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: DATABASE_URL
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: auth-secret
+                  key: SECRET_KEY
+            - name: ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: auth-secret
+                  key: ADMIN_USER
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: auth-secret
+                  key: ADMIN_PASSWORD
+            - name: ACCESS_TOKEN_DAYS
+              value: "30"
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth
+spec:
+  selector:
+    app: auth
+  ports:
+    - port: 8000
+      targetPort: 8000
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: auth-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: auth
+  minReplicas: 3
+  maxReplicas: 6
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+---
+#API
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+      - name: api
+        image: davids2006/siem_api:latest
+        imagePullPolicy: Always
+        ports:
+          - containerPort: 8001
+        env:
+          - name: DATABASE_URL
+            valueFrom:
+              secretKeyRef:
+                name: postgres-secret
+                key: DATABASE_URL
+          - name: AUTH_BASE_URL
+            value: "http://auth:8000"
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8001
+          initialDelaySeconds: 10
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8001
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 8001
+      targetPort: 8001
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 3
+  maxReplicas: 6
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+---
+#DASH
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: dashboard
+  template:
+    metadata:
+      labels:
+        app: dashboard
+    spec:
+      containers:
+      - name: grafana
+        image: davids2006/siem_dash:latest
+        imagePullPolicy: Always
+        ports:
+          - containerPort: 3000
+        env:
+          - name: API_HOST
+            value: "api"
+          - name: GF_DATABASE_TYPE
+            value: "postgres"
+          - name: GF_DATABASE_HOST
+            value: "postgres"                  # hostname do service do PostgreSQL
+          - name: GF_DATABASE_NAME
+            valueFrom:
+              secretKeyRef:
+                name: postgres-secret
+                key: POSTGRES_DB
+          - name: GF_DATABASE_USER
+            valueFrom:
+              secretKeyRef:
+                name: postgres-secret
+                key: POSTGRES_USER
+          - name: GF_DATABASE_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: postgres-secret
+                key: POSTGRES_PASSWORD
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashboard
+spec:
+  selector:
+    app: dashboard
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: dash-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: dashboard
+  minReplicas: 3
+  maxReplicas: 6
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+---
+#INGRESS
+piVersion: v1
+kind: Secret
+metadata:
+  name: tls-certificates
+  namespace: default
+type: kubernetes.io/tls
+data:
+  tls.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tDQpNSUlEVmpDQ0FqNmdBd0lCQWdJVVF3d3VZT0hpK3BZTmJvc2t0bVNFM2JJUnB0MHdEUVlKS29aSWh2Y05BUUVMDQpCUUF3SURFZU1Cd0dBMVVFQXd3VlpHRnphR0p2WVhKa0xtVjRZVzF3YkdVdVkyOXRNQjRYRFRJMk1ERXhOekUzDQpNelExTWxvWERUSTNNREV4TnpFM016UTFNbG93SURFZU1Cd0dBMVVFQXd3VlpHRnphR0p2WVhKa0xtVjRZVzF3DQpiR1V1WTI5dE1JSUJJakFOQmdrcWhraUc5dzBCQVFFRkFBT0NBUThBTUlJQkNnS0NBUUVBbCtneXZBM0syKzRODQpra2JDejVQTHMzTzc2L2NVN2tEaGM4dDZCSzZzSG9IK2FRRGtRMmdjT3puV2h0dWZ0eVFsNTZUYzlBZ2N6Q0pRDQo5RnovTnpOOEZHUUdBWHJUbXNkYlF0K1ZYSHpadGwxdTAvRWZsN2RLZzZnYUVWRElmRytVdlBGL2JiRW5JQXR6DQpmU0crdnBGcHU5VVlzMzVZVHZQODRjQy9TaFprVVZ0aGdiS1k1TU5iblo4UERFbUVtQnlSWTgzTGp5NFF1cVlKDQpjZ0t0b0NTMXRLSDBtNjNBS1QvWnZDSTQzRlpiREZkTVVENDF5VnREUVdBS3Z1TkFzOXVHSVJKb0RLZzhpeGxMDQpLQXNXWTluV0xRK01mRGxzZ1N3UVdsZ0FrZ0VrRjFRampzbWFMNmpYaDFSSlg0K2JjeVdDMEVpODU5alVpV3A5DQowK2EwcjZoVnp3SURBUUFCbzRHSE1JR0VNQjBHQTFVZERnUVdCQlNjVlhBUjBvOUozU0MyQ3hLKzNXV2w5VldPDQpvekFmQmdOVkhTTUVHREFXZ0JTY1ZYQVIwbzlKM1NDMkN4SyszV1dsOVZXT296QVBCZ05WSFJNQkFmOEVCVEFEDQpBUUgvTURFR0ExVWRFUVFxTUNpQ0ZXUmhjMmhpYjJGeVpDNWxlR0Z0Y0d4bExtTnZiWUlQWVhCcExtVjRZVzF3DQpiR1V1WTI5dE1BMEdDU3FHU0liM0RRRUJDd1VBQTRJQkFRQktBMGU0WDFVMitqL1NTVC9iWUh5VXhFMnZDS3lmDQpFd2lUaGEvU2N0OTFLL01DNnYrRTUwcFlSQzR2ZWJYR2lkdTVXd29QMjZpZzJ6Y09JVW1Nd3k4L3FSMHgyWVEwDQpOSmM3dThGeWUwdDdJKzJZUFV0VmpzM2RRak9HTDh5UTducy9wbVhPWTdITWc0Vm8rQ0JFOHljMVpEdFNHZDNjDQptRWFaNVYyZzVRb2pBaktGMGJpb3FGTmRZNTJrTFBSSlUrRW5OU2xFVG55YTY2cWRKZ2oyb0plMTdBNU1oT2hTDQpDL0Fvcm80cjIzdzhLWmhzQXZyaExhMnR1bENmak5hRDNsb09BYnhqeHIwT3AvRTAvQ29WMWJEeTc5U3lDUmhpDQpsTjZoTDl5VWVFTU9GbmFFbzlTTmFtTytXUm1rdFRXWlRvN2tKY3NQS0dtYW5ZS2J4VEN6UUg2eg0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQ0K
+  tls.key: LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tDQpNSUlFdkFJQkFEQU5CZ2txaGtpRzl3MEJBUUVGQUFTQ0JLWXdnZ1NpQWdFQUFvSUJBUUNYNkRLOERjcmI3ZzJTDQpSc0xQazh1emM3dnI5eFR1UU9Genkzb0VycXdlZ2Y1cEFPUkRhQnc3T2RhRzI1KzNKQ1hucE56MENCek1JbEQwDQpYUDgzTTN3VVpBWUJldE9heDF0QzM1VmNmTm0yWFc3VDhSK1h0MHFEcUJvUlVNaDhiNVM4OFg5dHNTY2dDM045DQpJYjYra1dtNzFSaXpmbGhPOC96aHdMOUtGbVJSVzJHQnNwamt3MXVkbnc4TVNZU1lISkZqemN1UExoQzZwZ2x5DQpBcTJnSkxXMG9mU2JyY0FwUDltOElqamNWbHNNVjB4UVBqWEpXME5CWUFxKzQwQ3oyNFloRW1nTXFEeUxHVXNvDQpDeFpqMmRZdEQ0eDhPV3lCTEJCYVdBQ1NBU1FYVkNPT3lab3ZxTmVIVkVsZmo1dHpKWUxRU0x6bjJOU0phbjNUDQo1clN2cUZYUEFnTUJBQUVDZ2dFQUZNa2RkQlR4RHBIdXduYXpQbU1MU3ZWSm4vcVJueDQ2bXpVYTc1d1ZDaUdnDQpkYTY5RFNvb1BzUmx3ZE00Y2Y5Y3Ztc1ZIc0VqYTUxQWRZZHFGcHdSWE5ybzVYZndqMnU2NVpZaFltUGxDR3FWDQplU096dm5kQ2wydy9rT0g4Wk9hQnRDN1pVR0dlcUdoWXQ2VVA3QlNLb3J5QVlrTW1BenVvZlIxNkwwR01IWU9NDQo0N2tUMUp3c2JZQTBDVTU0ZHladjkvZlZQY0RJaWNvcjhZQ0cxOUtPVVBkcDJaUm5RZGlJbmJQZFhvazkrVXVjDQo2cWFmbUtMK2VidUhoWkdmUnlBeDJicVF3a0ZqZUlwZGQ2bUk5MTloODVWeGVRODd0eks5dmVISGthZ2ZDaVVkDQpwSFBBRkREb215UFFQOUt4MGRJdElWaWlkT3MvdkdacGJjOG5Dc2xYdVFLQmdRRFR5ZWVEcHl0OUpQYjYvQVdqDQpVanJHbG8wM1ZTU2VKMGl2L0pvWE9QdVl4UWJJTDk5SHVsUkRHcmFVdnJ2aFkwQlkwcXV6YkxuVG5WTlhBdVpEDQpyVHJNbzNnUzJtNHhHbWlsUnlEMDhXUFNucXY5TmhHQlo3ejJUb3JlY0JwclBCRnFRdkd1UGxsQnFCUXlWSmlpDQo3a0M3WWdKdjMybzFJaExiWncrbkRrcjNKd0tCZ1FDM25pL2xwWUdTaEFBZUx2QjAwVVNpZDRCS2gxOFlteU5LDQptRHpGZnhZWXJvYUdUWi9pc2NHSitpemdsUWRpUUI0dWorWVBrSldrakJWMWU4OHNpVU1haHFCVUFKZTNpb0J1DQpVd1RjbTN6MHVncUVyczRvTlJHNWQxNG4vSXFYOWs0VDJOdG5ULzAzb3FISVo1NEtpRHZkV3NpS1ZsVWNiR0J5DQpQckROeFhBVkdRS0JnQUoyWklTNVd0NFhvZStGSXFPbGZ4MXovcXhZQnhiM3FmYXgzekRKN3RMMTU0QklYalk5DQpTbUdGVy80YXdhQjdRUEpIY011alJmM1o1SEFzam5UVy9Nb0lWSXNUa3hockVEQnJ4VXhUeWk5V3ZQVXl2YjFkDQpjV3NEdXNXZlZBOVBJWHkwem82U0Z3T1dhcld6R2hzNjNmSFB6K3R4RTVFT2xsMktzem5rQnFjZEFvR0FRT2h6DQphQXUwblJWNmNURUlvVkxrbjBYOUhOdHp1MkFEL3JlSUxBeDd4Q2ZWdUI0eW1kRmFhQ3IrdURrV1RoMzZUVjFpDQo1emVtSG0vQ21qQTFFVHBJZFZVSDBnb1BsN3NuSVZqSmpDNk80bmZ0aGUvQlFxZFg1NmNScXJMMFR6bXJhZ3FyDQpySDZ6TlhxUkZDWEUwVlpOU3pkdlVxK29FSThqSE4rYVluTWI1dWtDZ1lBYWdHSGdaYVJsOTNld0dXVEN6SzlLDQpvNHkrL2g0bnVDM1Bhb05ISVpiUnI2MSt6eFo1aDkyVzB2ZlB1MWk0QVRRNG0vU2lLRE45dElwQ21hd3Ntb04xDQpHUDFXNDBaR2NHU0w2RmJtVUJod3dBc1FQOGc0ejNGMlRoQ2l6eDhySUtKajhKZHA4SmwraVlkZGtXdGo0bDgwDQpPa3pmVFhHblJudTlZWVdzTmV0cmVnPT0NCi0tLS0tRU5EIFBSSVZBVEUgS0VZLS0tLS0NCg==
+---
+##  tem de ter instalado minikube addons enable ingress
+#minikube tunnel
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cluster-ingress
+  namespace: default
+  annotations:
+    # Redireciona HTTP para HTTPS
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+
+    # 🔑 Rewrite para corrigir 404 na dashboard
+    nginx.ingress.kubernetes.io/rewrite-target: /
+
+    # Limite de tamanho do corpo da requisição
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+
+    # Limite de conexões e RPS
+    nginx.ingress.kubernetes.io/limit-connections: "20"
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+
+    nginx.ingress.kubernetes.io/modsecurity-enabled: "true"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecRequestBodyAccess On
+
+      SecRule ARGS "(union.*select.*)|(select.*from.*information_schema)" \
+          "id:1001,phase:2,deny,status:403,msg:'SQL Injection attempt'"
+
+      SecRule ARGS "<script>" \
+          "id:1002,phase:2,deny,status:403,msg:'XSS attempt detected'"
+
+      SecRule REQUEST_HEADERS:User-Agent "BadBot|EvilScanner" \
+          "id:1003,phase:1,deny,status:403,msg:'Known bad bot'"
+
+      SecRequestBodyLimit 10485760
+      SecRequestBodyNoFilesLimit 1048576
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.siemk8s.com
+        - dashboard.siemk8s.com
+      secretName: tls-certificates
+  rules:
+    - host: api.siemk8s.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8001
+    - host: dashboard.siemk8s.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dashboard
+                port:
+                  number: 3000  # normalmente Grafana usa 3000 internamente
+########################################
+# 7️⃣ Logging centralizado (Fluentd → Elasticsearch → Kibana)
+########################################
+
+# ConfigMap do Fluentd
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-config
+  namespace: kube-system
+data:
+  fluent.conf: |
+    <source>
+      @type tail
+      path /var/log/containers/*.log
+      pos_file /var/log/fluentd-containers.log.pos
+      tag kubernetes.*
+      format json
+    </source>
+
+    <match kubernetes.**>
+      @type elasticsearch
+      host elasticsearch
+      port 9200
+      logstash_format true
+
+---
+# Elasticsearch
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elasticsearch
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+    spec:
+      containers:
+        - name: elasticsearch
+          image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+          env:
+            - name: discovery.type
+              value: single-node
+          ports:
+            - containerPort: 9200
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+spec:
+  selector:
+    app: elasticsearch
+  ports:
+    - port: 9200
+      targetPort: 9200
+---
+# Fluentd DaemonSet
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: fluentd
+  template:
+    metadata:
+      labels:
+        app: fluentd
+    spec:
+      containers:
+      - name: fluentd
+        image: fluent/fluentd:v1.16-debian-1
+        volumeMounts:
+          - name: varlog
+            mountPath: /var/log
+          - name: config-volume
+            mountPath: /fluentd/etc
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: config-volume
+          configMap:
+            name: fluentd-config
+---
+# Kibana (opcional)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kibana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kibana
+  template:
+    metadata:
+      labels:
+        app: kibana
+    spec:
+      containers:
+        - name: kibana
+          image: docker.elastic.co/kibana/kibana:8.11.0
+          env:
+            - name: ELASTICSEARCH_HOSTS
+              value: "http://elasticsearch:9200"
+          ports:
+            - containerPort: 5601
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kibana
+spec:
+  selector:
+    app: kibana
+  ports:
+    - port: 5601
+      targetPort: 5601
+
